@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+core_changes="$(git diff --cached --name-status -- core/)"
+
+if [[ -z "${core_changes}" ]]; then
+  exit 0
+fi
+
+missing=0
+
+skill_base_from_core_path() {
+  local path="$1"
+  local file base
+
+  file="${path##*/}"
+  base="${file%.skill.*}"
+
+  if [[ "${base}" == "${file}" || -z "${base}" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "${base}"
+}
+
+expected_paths_for_skill() {
+  local base="$1"
+  local slug antigravity_name
+
+  slug="$(printf '%s' "${base}" | tr '_' '-' | tr '[:upper:]' '[:lower:]')"
+  antigravity_name="$(printf '%s' "${base}" | tr '[:lower:]' '[:upper:]')"
+
+  printf '%s\n' \
+    "ide/antigravity/${antigravity_name}.AGENTS.md" \
+    "ide/claude-code/.claude/skills/${slug}/SKILL.md" \
+    "ide/codex/skills/${slug}/SKILL.md" \
+    "ide/kiro/steerings/${slug}.md"
+}
+
+staged_status_for_path() {
+  local path="$1"
+  git diff --cached --name-status -- "${path}" | awk 'NR == 1 { print $1 }'
+}
+
+check_expected_path() {
+  local core_status="$1"
+  local core_path="$2"
+  local expected_path="$3"
+  local expected_status
+
+  expected_status="$(staged_status_for_path "${expected_path}")"
+
+  case "${core_status}" in
+    A)
+      if [[ "${expected_status}" != "A" ]]; then
+        printf 'pre-commit: %s is staged as added, so %s must also be staged as added.\n' "${core_path}" "${expected_path}" >&2
+        missing=1
+      fi
+      ;;
+    M|T)
+      if [[ -z "${expected_status}" || "${expected_status}" == "D" ]]; then
+        printf 'pre-commit: %s is staged as modified, so %s must also be staged as modified.\n' "${core_path}" "${expected_path}" >&2
+        missing=1
+      fi
+      ;;
+    D)
+      if [[ "${expected_status}" != "D" ]]; then
+        printf 'pre-commit: %s is staged as deleted, so %s must also be staged as deleted.\n' "${core_path}" "${expected_path}" >&2
+        missing=1
+      fi
+      ;;
+  esac
+}
+
+while IFS=$'\t' read -r status path_a path_b; do
+  [[ -z "${status}" ]] && continue
+
+  if [[ "${status}" == R* || "${status}" == C* ]]; then
+    old_base="$(skill_base_from_core_path "${path_a}")" || old_base=""
+    new_base="$(skill_base_from_core_path "${path_b}")" || new_base=""
+
+    if [[ -n "${old_base}" ]]; then
+      while IFS= read -r expected_path; do
+        check_expected_path "D" "${path_a}" "${expected_path}"
+      done < <(expected_paths_for_skill "${old_base}")
+    fi
+
+    if [[ -n "${new_base}" ]]; then
+      while IFS= read -r expected_path; do
+        check_expected_path "A" "${path_b}" "${expected_path}"
+      done < <(expected_paths_for_skill "${new_base}")
+    fi
+
+    continue
+  fi
+
+  base="$(skill_base_from_core_path "${path_a}")" || continue
+  core_status="${status:0:1}"
+
+  while IFS= read -r expected_path; do
+    check_expected_path "${core_status}" "${path_a}" "${expected_path}"
+  done < <(expected_paths_for_skill "${base}")
+done <<< "${core_changes}"
+
+if [[ "${missing}" -ne 0 ]]; then
+  printf '\npre-commit: update and stage every IDE conversion for each changed core skill.\n' >&2
+  exit 1
+fi
